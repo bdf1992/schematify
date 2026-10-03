@@ -72,6 +72,19 @@ graphify-out/
 
 ---
 
+## schematify
+
+schematify is a fork of graphify ([Graphify-Labs/graphify](https://github.com/Graphify-Labs/graphify)), kept to add one export: `graphify export sov`. It writes graphify's code graph as a Schematically document: a card for each function, class and module, a group for each community, and a wire for each edge, labelled from the edge's relation and carrying `config.basis` `EXTRACTED` or `INFERRED`. The document is laid out by a Schematically checkout passed by path (`--schematically DIR` or the `SCHEMATICALLY_DIR` environment variable), and code needs no LLM. Upstream's Apache-2.0 `LICENSE`, `NOTICE` and `LICENSE-MIT` are kept unchanged, and everything else in this README is upstream's.
+
+```bash
+graphify extract <dir> --code-only
+graphify export sov <dir>/graphify-out/graph.json --schematically <checkout>
+```
+
+This writes `<dir>/graphify-out/graph.sov`.
+
+---
+
 ## See it in action
 
 <p align="center">
