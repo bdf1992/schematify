@@ -30,6 +30,7 @@ def test_help_lists_prs_provider_and_export_formats():
         "wiki",
         "svg",
         "graphml",
+        "sov",
         "neo4j",
         "falkordb",
     ):

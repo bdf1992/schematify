@@ -866,6 +866,7 @@ def _run_cli() -> None:
         print("  export wiki             emit wiki markdown articles [--graph PATH] [--labels PATH]")
         print("  export svg              emit graph.svg [--graph PATH] [--labels PATH]")
         print("  export graphml          emit GraphML [--graph PATH]")
+        print("  export sov              emit a Schematically .sov laid out by a Schematically checkout [--graph PATH] [--output SOV] --schematically DIR")
         print("  export neo4j            emit Cypher or push to Neo4j [--graph PATH] [--push URI] [--user U] [--password P]")
         print("                          (or set NEO4J_PASSWORD instead of --password to keep it off argv)")
         print("  export falkordb         emit Cypher or push to FalkorDB [--graph PATH] [--push URI] [--user U] [--password P]")

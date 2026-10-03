@@ -2836,7 +2836,7 @@ def dispatch_command(cmd: str) -> None:
 
     elif cmd == "export":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
-        if subcmd not in ("html", "callflow-html", "obsidian", "wiki", "svg", "graphml", "neo4j", "falkordb"):
+        if subcmd not in ("html", "callflow-html", "obsidian", "wiki", "svg", "graphml", "sov", "neo4j", "falkordb"):
             print("Usage: graphify export <format>", file=sys.stderr)
             print("  html      [--graph PATH] [--labels PATH] [--node-limit N] [--no-viz]", file=sys.stderr)
             print("  callflow-html [GRAPH|DIR] [--graph PATH] [--labels PATH] [--report PATH] [--sections PATH] [--output HTML]", file=sys.stderr)
@@ -2845,7 +2845,8 @@ def dispatch_command(cmd: str) -> None:
             print("  wiki      [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  svg       [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  graphml   [--graph PATH]", file=sys.stderr)
-            print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
+            print("  sov       [GRAPH] [--graph PATH] [--output SOV] [--schematically DIR] [--label-length N] [--no-layout]", file=sys.stderr)
+            print("  neo4j    [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
             print("            (or set FALKORDB_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
@@ -2870,6 +2871,9 @@ def dispatch_command(cmd: str) -> None:
         node_limit = 5000
         no_viz = False
         obsidian_dir = Path(_GRAPHIFY_OUT) / "obsidian"
+        sov_schematically: str | None = os.environ.get("SCHEMATICALLY_DIR") or None
+        sov_label_length: int | None = None
+        sov_layout = True
         # Shared push-connection settings for the graph-database sinks (neo4j,
         # falkordb), parsed from the generic --push/--user/--password flags below.
         push_uri: str | None = None
@@ -2937,7 +2941,18 @@ def dispatch_command(cmd: str) -> None:
                 push_user = args[i + 1]; i += 2
             elif a == "--password" and i + 1 < len(args):
                 push_password = args[i + 1]; i += 2
-            elif subcmd == "callflow-html" and not a.startswith("-") and not graph_path_explicit:
+            elif subcmd == "sov" and a == "--schematically" and i + 1 < len(args):
+                sov_schematically = args[i + 1]; i += 2
+            elif subcmd == "sov" and a == "--label-length" and i + 1 < len(args):
+                try:
+                    sov_label_length = int(args[i + 1])
+                except ValueError:
+                    print(f"error: --label-length needs an integer, got {args[i + 1]!r}", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif subcmd == "sov" and a == "--no-layout":
+                sov_layout = False; i += 1
+            elif subcmd in ("callflow-html", "sov") and not a.startswith("-") and not graph_path_explicit:
                 candidate = Path(a)
                 if candidate.name == "graph.json" or candidate.suffix.lower() == ".json":
                     graph_path = candidate
@@ -2980,6 +2995,49 @@ def dispatch_command(cmd: str) -> None:
                 verbose=True,
             )
             print(f"callflow HTML written - open in any browser: {out}")
+            sys.exit(0)
+
+        if subcmd == "sov":
+            # Reads graph.json's raw links (their true direction), never the
+            # networkx graph built below for the other formats.
+            from graphify.exporters.sov import LABEL_LENGTH as _SOV_LABEL_LENGTH, to_sov as _to_sov
+            from graphify.security import check_graph_file_size_cap as _check_cap
+            try:
+                _check_cap(graph_path)
+            except ValueError as _cap_err:
+                print(f"error: {_cap_err}", file=sys.stderr)
+                sys.exit(1)
+            if sov_layout and not sov_schematically:
+                print(
+                    "error: no Schematically checkout to lay the document out: "
+                    "pass --schematically DIR, set SCHEMATICALLY_DIR, or pass --no-layout",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            _sov_raw = json.loads(graph_path.read_text(encoding="utf-8"))
+            _sov_labels = None
+            if labels_path.exists():
+                _sov_labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
+            _sov_out = callflow_output or (graph_path.parent / "graph.sov")
+            try:
+                _res = _to_sov(
+                    _sov_raw,
+                    _sov_out,
+                    schematically_dir=sov_schematically,
+                    community_labels=_sov_labels,
+                    label_length=sov_label_length if sov_label_length is not None else _SOV_LABEL_LENGTH,
+                    layout=sov_layout,
+                )
+            except (ValueError, RuntimeError) as _sov_err:
+                print(f"error: {_sov_err}", file=sys.stderr)
+                sys.exit(1)
+            _cards_n = sum(_res["cards"].values())
+            _wires_n = sum(_res["wires"].values())
+            print(
+                f"graph.sov written: {_cards_n} cards, {_wires_n} wires "
+                f"({_res['wires']['EXTRACTED']} extracted, {_res['wires']['INFERRED']} inferred), "
+                f"{_res['groups']} groups -> {_res['output']}"
+            )
             sys.exit(0)
 
         from networkx.readwrite import json_graph as _jg
