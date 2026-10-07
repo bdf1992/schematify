@@ -234,6 +234,29 @@ def sov_counts(document: dict, skipped: int) -> dict:
     return {"cards": cards, "skipped": skipped, "wires": wires, "groups": groups}
 
 
+def _run_layout(text: str, output_path: Path, *, node_exe: str, script: Path) -> None:
+    """Write ``text`` to ``output_path`` by running Schematically's layout_sov.mjs."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(output_path.parent), prefix=".schematify-", suffix=".sov")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        proc = subprocess.run(
+            [node_exe, str(script), tmp, "--out", str(output_path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"layout_sov.mjs exited {proc.returncode}\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def to_sov(data: dict, output_path, *, schematically_dir=None, community_labels: dict | None = None,
            label_length: int = LABEL_LENGTH, layout: bool = True, node: str = "node") -> dict:
     """Write the document to ``output_path``, laid out by a Schematically checkout.
@@ -265,25 +288,224 @@ def to_sov(data: dict, output_path, *, schematically_dir=None, community_labels:
     if not layout:
         write_text_atomic(output_path, text)
     else:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(output_path.parent), prefix=".schematify-", suffix=".sov")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(text)
-            proc = subprocess.run(
-                [node_exe, str(script), tmp, "--out", str(output_path)],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"layout_sov.mjs exited {proc.returncode}\n"
-                    f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-                )
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        _run_layout(text, output_path, node_exe=node_exe, script=script)
     counts = sov_counts(document, skipped)
     counts["output"] = str(output_path)
     return counts
+
+
+def community_pairs(
+    data: dict, card_of: dict[str, str], community_of: dict[str, int | None]
+) -> list[tuple[tuple[int, int], int]]:
+    """Every distinct community pair bridged by a non-structural link, with its count.
+
+    Follows the same counting pattern as ``inter_community_edges`` in
+    graphify/export.py: one count per unordered community pair, one increment per
+    qualifying link. Pure, no I/O.
+    """
+    counts: dict[tuple[int, int], int] = {}
+    for link in _links(data):
+        relation = str(link.get("relation") or "")
+        if relation in STRUCTURAL_RELATIONS:
+            continue
+        a_card = card_of.get(str(link.get("source")))
+        b_card = card_of.get(str(link.get("target")))
+        if a_card is None or b_card is None:
+            continue
+        a_community = community_of.get(a_card)
+        b_community = community_of.get(b_card)
+        if a_community is None or b_community is None:
+            continue
+        if a_community == b_community:
+            continue
+        key = tuple(sorted((a_community, b_community)))
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items())
+
+
+def community_title(members: list[dict], *, links: list[dict] | None = None) -> str:
+    """The title for a community: its members' shared module path, or its top member's name.
+
+    ``links`` is the raw graph's own non-structural links, used to rank members by
+    degree (how many such links touch each member's id, a self-loop counting twice).
+    The top-ranked member's own label is the fallback candidate; the shared directory
+    prefix of every member's ``source_file``, when two or more segments deep, wins
+    over it.
+    """
+
+    def _degree(node_id) -> int:
+        nid = str(node_id)
+        count = 0
+        for link in (links or []):
+            relation = str(link.get("relation") or "")
+            if relation in STRUCTURAL_RELATIONS:
+                continue
+            if str(link.get("source")) == nid:
+                count += 1
+            if str(link.get("target")) == nid:
+                count += 1
+        return count
+
+    def _label_of(member: dict) -> str:
+        return _card_label(str(member.get("label") or member.get("id")))
+
+    ranked = sorted(members, key=lambda m: (-_degree(m.get("id")), len(_label_of(m)), _label_of(m)))
+    candidate = _label_of(ranked[0])
+
+    dir_parts_list: list[list[str]] = []
+    for member in members:
+        source_file = str(member.get("source_file") or "")
+        parts = re.split(r"[/\\]", source_file)
+        dir_parts_list.append(parts[:-1] if parts else [])
+
+    common: list[str] = []
+    if dir_parts_list and all(len(parts) > 0 for parts in dir_parts_list):
+        first = dir_parts_list[0]
+        for i, token in enumerate(first):
+            if all(len(parts) > i and parts[i] == token for parts in dir_parts_list):
+                common.append(token)
+            else:
+                break
+
+    module_path = "/".join(common)
+    return module_path if len(common) >= 2 else candidate
+
+
+def communities_to_sov(data: dict, *, community_labels: dict | None = None,
+                        communities_dir_name: str) -> dict:
+    """The top-level Schematically document for ``--level communities``.
+
+    One card per community (``group``, labelled by ``community_title``, with a
+    ``documentRef`` to its own document under ``communities_dir_name``), one wire per
+    community pair from ``community_pairs``, labelled with its edge count.
+    """
+    _cards_list, card_of, community_of, _skipped = _cards(list(data.get("nodes") or []))
+    node_by_card: dict[str, dict] = {}
+    for node in data.get("nodes") or []:
+        if node_kind(node) is None:
+            continue
+        cid = card_of.get(str(node.get("id")))
+        if cid is not None:
+            node_by_card[cid] = node
+
+    members_by_community: dict[int, list[dict]] = {}
+    for cid, community in community_of.items():
+        if community is None:
+            continue
+        members_by_community.setdefault(community, []).append(node_by_card[cid])
+
+    links = _links(data)
+    components = []
+    for n in sorted(members_by_community):
+        members = members_by_community[n]
+        components.append({
+            "id": f"community-{n}",
+            "symbolId": "group",
+            "config": {
+                "label": community_title(members, links=links),
+                "members": sorted(card_of[str(m["id"])] for m in members),
+                "documentRef": f"{communities_dir_name}/community-{n}.sov",
+            },
+        })
+
+    pairs = community_pairs(data, card_of, community_of)
+    wires = [
+        {
+            "id": f"w-community-{lo}-community-{hi}",
+            "a": f"community-{lo}",
+            "aSide": "out",
+            "b": f"community-{hi}",
+            "bSide": "in",
+            "canvasId": CANVAS,
+            "config": {"label": str(count)},
+        }
+        for (lo, hi), count in pairs
+    ]
+
+    return {
+        "schema": SCHEMA,
+        "id": "schematify",
+        "revision": 0,
+        "meta": {"title": f"schematify: {len(components)} communities"},
+        "references": [],
+        "components": components,
+        "wires": wires,
+    }
+
+
+def community_document(data: dict, cid: int, *, community_labels: dict | None = None,
+                        label_length: int = LABEL_LENGTH) -> dict:
+    """``graph_to_sov`` restricted to one community's own members."""
+    nodes = [node for node in (data.get("nodes") or []) if _community(node) == cid]
+    ids = {str(node.get("id")) for node in nodes}
+    links = [
+        link for link in _links(data)
+        if str(link.get("source")) in ids and str(link.get("target")) in ids
+    ]
+    sub_data = {
+        "directed": data.get("directed"),
+        "multigraph": data.get("multigraph"),
+        "graph": data.get("graph"),
+        "nodes": nodes,
+        "links": links,
+    }
+    return graph_to_sov(sub_data, community_labels=community_labels, label_length=label_length)
+
+
+def to_sov_communities(data: dict, output_path, *, schematically_dir=None,
+                        community_labels: dict | None = None, label_length: int = LABEL_LENGTH,
+                        layout: bool = True, node: str = "node") -> dict:
+    """Write one card-and-wire document of communities, plus one document per community.
+
+    Validates the checkout, its ``scripts/layout_sov.mjs`` and ``node`` the same way
+    ``to_sov`` does, before writing anything, when ``layout`` is true.
+    """
+    output_path = Path(output_path)
+    node_exe = None
+    script = None
+    if layout:
+        if schematically_dir is None:
+            raise ValueError(
+                "no Schematically checkout: schematically_dir is None and layout is on"
+            )
+        script = Path(schematically_dir) / "scripts" / "layout_sov.mjs"
+        if not script.is_file():
+            raise ValueError(f"layout script not found: {script}")
+        node_exe = shutil.which(node)
+        if node_exe is None:
+            raise ValueError(f"node not found: {node!r} is not on PATH")
+
+    communities_dir_name = f"{Path(output_path).stem}.communities"
+    communities_dir = Path(output_path).parent / communities_dir_name
+    communities_dir.mkdir(parents=True, exist_ok=True)
+
+    top_doc = communities_to_sov(
+        data, community_labels=community_labels, communities_dir_name=communities_dir_name
+    )
+    _cards_list, _card_of, community_of, _skipped = _cards(list(data.get("nodes") or []))
+    community_ids = sorted({c for c in community_of.values() if c is not None})
+
+    top_text = dumps_sov(top_doc)
+    if layout:
+        _run_layout(top_text, output_path, node_exe=node_exe, script=script)
+    else:
+        write_text_atomic(output_path, top_text)
+
+    total_members = 0
+    for cid in community_ids:
+        doc = community_document(data, cid, community_labels=community_labels, label_length=label_length)
+        total_members += sum(1 for c in doc["components"] if c["symbolId"] != "group")
+        doc_text = dumps_sov(doc)
+        doc_path = communities_dir / f"community-{cid}.sov"
+        if layout:
+            _run_layout(doc_text, doc_path, node_exe=node_exe, script=script)
+        else:
+            write_text_atomic(doc_path, doc_text)
+
+    return {
+        "communities": len(community_ids),
+        "wires": len(top_doc["wires"]),
+        "members": total_members,
+        "output": str(output_path),
+        "communities_dir": str(communities_dir),
+    }

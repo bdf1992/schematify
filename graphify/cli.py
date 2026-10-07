@@ -2845,7 +2845,7 @@ def dispatch_command(cmd: str) -> None:
             print("  wiki      [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  svg       [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  graphml   [--graph PATH]", file=sys.stderr)
-            print("  sov       [GRAPH] [--graph PATH] [--output SOV] [--schematically DIR] [--label-length N] [--no-layout]", file=sys.stderr)
+            print("  sov       [GRAPH] [--graph PATH] [--output SOV] [--schematically DIR] [--label-length N] [--no-layout] [--level nodes|communities]", file=sys.stderr)
             print("  neo4j    [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
@@ -2874,6 +2874,7 @@ def dispatch_command(cmd: str) -> None:
         sov_schematically: str | None = os.environ.get("SCHEMATICALLY_DIR") or None
         sov_label_length: int | None = None
         sov_layout = True
+        sov_level = "nodes"
         # Shared push-connection settings for the graph-database sinks (neo4j,
         # falkordb), parsed from the generic --push/--user/--password flags below.
         push_uri: str | None = None
@@ -2952,6 +2953,8 @@ def dispatch_command(cmd: str) -> None:
                 i += 2
             elif subcmd == "sov" and a == "--no-layout":
                 sov_layout = False; i += 1
+            elif subcmd == "sov" and a == "--level" and i + 1 < len(args):
+                sov_level = args[i + 1]; i += 2
             elif subcmd in ("callflow-html", "sov") and not a.startswith("-") and not graph_path_explicit:
                 candidate = Path(a)
                 if candidate.name == "graph.json" or candidate.suffix.lower() == ".json":
@@ -2998,6 +3001,9 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(0)
 
         if subcmd == "sov":
+            if sov_level not in ("nodes", "communities"):
+                print("error: --level must be nodes or communities", file=sys.stderr)
+                sys.exit(1)
             # Reads graph.json's raw links (their true direction), never the
             # networkx graph built below for the other formats.
             from graphify.exporters.sov import LABEL_LENGTH as _SOV_LABEL_LENGTH, to_sov as _to_sov
@@ -3019,6 +3025,25 @@ def dispatch_command(cmd: str) -> None:
             if labels_path.exists():
                 _sov_labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
             _sov_out = callflow_output or (graph_path.parent / "graph.sov")
+            if sov_level == "communities":
+                from graphify.exporters.sov import to_sov_communities as _to_sov_communities
+                try:
+                    _cres = _to_sov_communities(
+                        _sov_raw,
+                        _sov_out,
+                        schematically_dir=sov_schematically,
+                        community_labels=_sov_labels,
+                        label_length=sov_label_length if sov_label_length is not None else _SOV_LABEL_LENGTH,
+                        layout=sov_layout,
+                    )
+                except (ValueError, RuntimeError) as _sov_err:
+                    print(f"error: {_sov_err}", file=sys.stderr)
+                    sys.exit(1)
+                print(
+                    f"graph.sov written: {_cres['communities']} communities, {_cres['wires']} wires, "
+                    f"{_cres['members']} members -> {_cres['output']} ({_cres['communities_dir']})"
+                )
+                sys.exit(0)
             try:
                 _res = _to_sov(
                     _sov_raw,
